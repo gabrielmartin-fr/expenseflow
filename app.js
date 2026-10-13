@@ -783,7 +783,7 @@ async function ocrClaude(blob, S) {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-api-key': S.apiKey, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
     body: JSON.stringify({
-      model: S.model, max_tokens: 400,
+      model: S.model, max_tokens: 2000, output_config: { effort: 'low' },
       messages: [{ role: 'user', content: [
         { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: b64 } },
         { type: 'text', text: 'Lis ce ticket de caisse. Réponds uniquement par un objet JSON : {"merchant": string, "amount": nombre (total TTC payé), "date": "AAAA-MM-JJ" ou null, "vat": nombre (montant total de TVA) ou null, "vat_rate": nombre (taux en %) ou null, "category": "meals"|"travel"|"lodging"|"supplies"|"other", "confidence": nombre entre 0 et 1}. Ignore les soldes de compte et sous-totaux : amount est le net à payer.' },
