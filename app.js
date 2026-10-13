@@ -252,6 +252,7 @@ routes.stats = function () {
   const prev = counted(inRange(expenses, r.pFrom, r.pTo));
   const total = sum(cur), ptotal = sum(prev);
   const delta = ptotal > 0 ? Math.round((total - ptotal) / ptotal * 100) : null;
+  const vatTotal = cur.reduce((s, e) => s + (e.vat || 0), 0);
   const budget = S.budget * r.budgetFactor;
   const bpct = budget > 0 ? Math.round(total / budget * 100) : 0;
 
@@ -278,6 +279,7 @@ routes.stats = function () {
       ${delta === null ? '' : `<div class="mt16"><span class="pill-trend ${delta > 0 ? 'up' : ''}">${ic(delta > 0 ? 'trending_up' : 'trending_down', 'xs')} ${Math.abs(delta)}% vs ${r.label}</span></div>`}
       <div class="row between mt24" style="padding-top:24px;border-top:1px solid var(--outv)">
         <div><p class="label">Moyenne journalière</p><p class="sec">${eur(total / r.days)}</p></div>
+        <div style="text-align:center"><p class="label">Dont TVA</p><p class="sec">${eur(vatTotal)}</p></div>
         <div class="right"><p class="label">Transactions</p><p class="sec">${cur.length}</p></div>
       </div>
     </div>
@@ -317,7 +319,7 @@ let draft = null;        // dépense en cours d'édition
 let draftIsNew = false;
 
 function newDraft(image) {
-  return { id: uid(), merchant: '', amount: '', date: ymd(new Date()), category: 'other', status: 'pending', notes: '', image: image || null, confidence: null, createdAt: Date.now(), dirty: new Set(), ocr: image ? 'running' : 'none', ocrMsg: '' };
+  return { id: uid(), merchant: '', amount: '', date: ymd(new Date()), category: 'other', status: 'pending', notes: '', vat: '', vatRate: '', image: image || null, ocrSource: null, confidence: null, createdAt: Date.now(), dirty: new Set(), ocr: image ? 'running' : 'none', ocrMsg: '' };
 }
 
 routes.new = function () { draft = newDraft(null); draftIsNew = true; location.replace('#/review'); };
@@ -325,7 +327,7 @@ routes.new = function () { draft = newDraft(null); draftIsNew = true; location.r
 routes.expense = function (id) {
   const e = expenses.find(x => x.id === id);
   if (!e) { toast('Dépense introuvable'); location.replace('#/history'); return; }
-  draft = { ...e, amount: String(e.amount).replace('.', ','), dirty: new Set(), ocr: 'none', ocrMsg: '' };
+  draft = { ...e, amount: String(e.amount).replace('.', ','), vat: e.vat != null ? fmtNum(e.vat) : '', vatRate: e.vatRate != null ? String(e.vatRate).replace('.', ',') : '', ocrSource: null, dirty: new Set(), ocr: 'none', ocrMsg: '' };
   draftIsNew = false;
   location.replace('#/review');
 };
@@ -347,6 +349,11 @@ routes.review = function () {
           <label class="f"><span class="label">Montant (€)</span><input class="inp amount" id="amount" type="text" inputmode="decimal" value="${esc(d.amount)}" placeholder="0,00"></label>
           <label class="f"><span class="label">Date</span><input class="inp" id="date" type="date" value="${esc(d.date)}"></label>
         </div>
+        <div class="grid2">
+          <label class="f"><span class="label">TVA (€)</span><input class="inp" id="vat" type="text" inputmode="decimal" value="${esc(d.vat)}" placeholder="0,00"></label>
+          <label class="f"><span class="label">Taux TVA (%)</span><input class="inp" id="vatRate" type="text" inputmode="decimal" value="${esc(d.vatRate)}" placeholder="ex. 10"></label>
+        </div>
+        <p class="muted" id="ht" style="margin-top:-8px"></p>
         <label class="f"><span class="label">Catégorie</span>
           <div class="field">${ic('category')}<select class="inp pl" id="category">${Object.entries(CATS).map(([k, c]) => `<option value="${k}" ${d.category === k ? 'selected' : ''}>${esc(c.label)}</option>`).join('')}</select>${ic('expand_more', 'r')}</div></label>
         <label class="f"><span class="label">Statut du remboursement</span>
@@ -363,11 +370,12 @@ routes.review = function () {
   render({ title: draftIsNew ? 'Validation de dépense' : 'Détails de la dépense', back: true, html, nav: false });
 
   paintOcrState();
-  ['merchant', 'amount', 'date', 'category', 'status', 'notes'].forEach(k => {
-    $('#' + k).addEventListener('input', e => { d[k] = e.target.value; d.dirty.add(k); });
+  ['merchant', 'amount', 'vat', 'vatRate', 'date', 'category', 'status', 'notes'].forEach(k => {
+    $('#' + k).addEventListener('input', e => { d[k] = e.target.value; d.dirty.add(k); updateHt(); });
   });
+  updateHt();
   const r = $('#rcpt'); if (r) r.onclick = () => openLightbox(imgUrl);
-  const redo = $('#redo'); if (redo) redo.onclick = () => { d.dirty.clear(); runOcr(); };
+  const redo = $('#redo'); if (redo) redo.onclick = () => { d.dirty.clear(); d.vat = ''; d.vatRate = ''; runOcr(); };
   const del = $('#del'); if (del) del.onclick = async () => {
     if (!confirm('Supprimer définitivement cette dépense ?')) return;
     await DB.del(d.id); await reload(); draft = null; toast('Dépense supprimée'); location.replace('#/history');
@@ -378,12 +386,21 @@ routes.review = function () {
     if (!d.merchant.trim()) { toast('Indiquez le commerçant'); $('#merchant').focus(); return; }
     if (!(amount > 0)) { toast('Indiquez un montant valide'); $('#amount').focus(); return; }
     if (!d.date) { toast('Indiquez la date'); return; }
-    const rec = { id: d.id, merchant: d.merchant.trim(), amount, date: d.date, category: d.category, status: d.status, notes: d.notes.trim(), image: d.image, confidence: d.confidence, createdAt: d.createdAt };
+    const vat = parseAmount(d.vat), vatRate = parseAmount(d.vatRate);
+    if (vat >= amount) { toast('La TVA doit être inférieure au montant'); $('#vat').focus(); return; }
+    const rec = { id: d.id, merchant: d.merchant.trim(), amount, vat: vat > 0 ? vat : null, vatRate: vatRate > 0 ? vatRate : null, date: d.date, category: d.category, status: d.status, notes: d.notes.trim(), image: d.image, confidence: d.confidence, createdAt: d.createdAt };
     await DB.put(rec); await reload(); draft = null;
     toast(draftIsNew ? 'Dépense enregistrée' : 'Modifications enregistrées');
     location.replace('#/history');
   };
 };
+
+const fmtNum = n => n.toFixed(2).replace('.', ',');
+function updateHt() {
+  const el = $('#ht'); if (!el || !draft) return;
+  const a = parseAmount(draft.amount), v = parseAmount(draft.vat);
+  el.textContent = a > 0 && v > 0 && v < a ? `Montant HT : ${eur(a - v)}` : '';
+}
 
 function parseAmount(s) { return parseFloat(String(s).replace(/\s/g, '').replace(',', '.')); }
 
@@ -422,7 +439,7 @@ async function runOcr() {
     if (S.provider === 'claude' && S.apiKey) res = await ocrClaude(d.image, S);
     else {
       if (S.provider === 'claude') toast('Clé API absente : lecture locale utilisée');
-      res = await ocrLocal(d.image, m => { d.ocrMsg = m; const el = $('#ocrmsg'); if (el && draft === d) el.textContent = m; });
+      res = await ocrLocal(d.ocrSource || d.image, m => { d.ocrMsg = m; const el = $('#ocrmsg'); if (el && draft === d) el.textContent = m; });
     }
     if (draft !== d) return;
     applyOcr(d, res);
@@ -439,55 +456,183 @@ function applyOcr(d, r) {
   if (!d.dirty.has('amount') && r.amount > 0) d.amount = String(r.amount.toFixed(2)).replace('.', ',');
   if (!d.dirty.has('date') && r.date) d.date = r.date;
   if (!d.dirty.has('category') && r.category && CATS[r.category]) d.category = r.category;
+  if (!d.dirty.has('vat')) d.vat = r.vat > 0 ? fmtNum(r.vat) : '';
+  if (!d.dirty.has('vatRate')) d.vatRate = r.vatRate > 0 ? String(r.vatRate).replace('.', ',') : '';
   if (r.confidence != null) d.confidence = r.confidence;
 }
 
 function syncForm() {
   const d = draft; if (!d) return;
-  for (const k of ['merchant', 'amount', 'date', 'category']) { const el = $('#' + k); if (el && !d.dirty.has(k)) el.value = d[k]; }
+  for (const k of ['merchant', 'amount', 'vat', 'vatRate', 'date', 'category']) { const el = $('#' + k); if (el && !d.dirty.has(k)) el.value = d[k]; }
+  updateHt();
+}
+
+// recadre sur le ticket, passe en niveaux de gris contrastés (le scan peut être une page A4 avec un petit ticket)
+async function cropToContent(blob) {
+  const bmp = await createImageBitmap(blob);
+  const k0 = Math.min(1, 3500 / Math.max(bmp.width, bmp.height));
+  const w = Math.round(bmp.width * k0), h = Math.round(bmp.height * k0);
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(bmp, 0, 0, w, h);
+  const img = ctx.getImageData(0, 0, w, h), px = img.data;
+
+  const g = new Uint8Array(w * h), hist = new Uint32Array(256);
+  for (let i = 0, p = 0; i < g.length; i++, p += 4) {
+    const v = (px[p] * 0.299 + px[p + 1] * 0.587 + px[p + 2] * 0.114) | 0;
+    g[i] = v; hist[v]++;
+  }
+  const pct = q => { let acc = 0; const t = g.length * q; for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= t) return v; } return 255; };
+  const lo = pct(0.005), hi = Math.max(lo + 40, pct(0.9));
+  for (let i = 0; i < g.length; i++) g[i] = Math.max(0, Math.min(255, ((g[i] - lo) * 255) / (hi - lo)));
+
+  // zone du ticket : cellules de 16 px contenant de l'encre et entourées d'autres cellules (ignore les poussières du scan)
+  const S = 16, gw = Math.ceil(w / S), gh = Math.ceil(h / S), cells = new Uint16Array(gw * gh);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (g[y * w + x] < 160) cells[(y >> 4) * gw + (x >> 4)]++;
+  const on = (cx, cy) => cx >= 0 && cy >= 0 && cx < gw && cy < gh && cells[cy * gw + cx] >= 4;
+  let x0 = gw, y0 = gh, x1 = -1, y1 = -1;
+  for (let cy = 0; cy < gh; cy++) for (let cx = 0; cx < gw; cx++) {
+    if (!on(cx, cy)) continue;
+    let n = 0;
+    for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) if ((dx || dy) && on(cx + dx, cy + dy)) n++;
+    if (n < 4) continue;
+    if (cx < x0) x0 = cx; if (cx > x1) x1 = cx; if (cy < y0) y0 = cy; if (cy > y1) y1 = cy;
+  }
+  let sx = 0, sy = 0, sw = w, sh = h;
+  if (x1 >= 0) {
+    const m = 40;
+    sx = Math.max(0, x0 * S - m); sy = Math.max(0, y0 * S - m);
+    sw = Math.min(w, (x1 + 1) * S + m) - sx; sh = Math.min(h, (y1 + 1) * S + m) - sy;
+  }
+  const scale = Math.max(1, Math.min(2.5, 1800 / Math.max(sw, sh)));
+  const out = document.createElement('canvas'); out.width = sw; out.height = sh;
+  const oi = out.getContext('2d').createImageData(sw, sh);
+  for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) {
+    const v = g[(sy + y) * w + sx + x], o = (y * sw + x) * 4;
+    oi.data[o] = oi.data[o + 1] = oi.data[o + 2] = v; oi.data[o + 3] = 255;
+  }
+  out.getContext('2d').putImageData(oi, 0, 0);
+  if (scale === 1) return out;
+  const big = document.createElement('canvas'); big.width = Math.round(sw * scale); big.height = Math.round(sh * scale);
+  big.getContext('2d').drawImage(out, 0, 0, big.width, big.height);
+  return big;
+}
+
+function rotateCanvas(c, a) {
+  if (!a) return c;
+  const r = document.createElement('canvas'), flat = a === 180;
+  r.width = flat ? c.width : c.height; r.height = flat ? c.height : c.width;
+  const x = r.getContext('2d');
+  x.translate(r.width / 2, r.height / 2); x.rotate(a * Math.PI / 180);
+  x.drawImage(c, -c.width / 2, -c.height / 2);
+  return r;
 }
 
 async function ocrLocal(blob, onMsg) {
   onMsg('Chargement du moteur OCR…');
   if (!window.Tesseract) await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js');
-  const { data } = await Tesseract.recognize(blob, 'fra', {
-    logger: m => { if (m.status) onMsg(m.status.includes('recogniz') ? `Lecture du texte… ${Math.round((m.progress || 0) * 100)}%` : 'Préparation (langue française)…'); },
+  onMsg('Préparation de l’image…');
+  const base = await cropToContent(blob);
+  const worker = await Tesseract.createWorker('fra', 1, {
+    logger: m => { if (m.status === 'recognizing text') onMsg(`Lecture du texte… ${Math.round((m.progress || 0) * 100)}%`); else if (m.status) onMsg('Préparation (langue française)…'); },
   });
-  const out = parseReceipt(data.text);
-  out.confidence = data.confidence;
-  return out;
+  try {
+    await worker.setParameters({ tessedit_pageseg_mode: '4', preserve_interword_spaces: '1' });
+    let best = null;
+    // essaie l'orientation d'origine puis les rotations (ticket scanné ou photographié de travers)
+    for (const angle of [0, 90, 270, 180]) {
+      if (angle) onMsg(`Test de l’orientation (${angle}°)…`);
+      const { data } = await worker.recognize(rotateCanvas(base, angle));
+      const good = data.words
+        ? data.words.filter(w => w.confidence > 70 && w.text.replace(/[^A-Za-zÀ-ÿ0-9]/g, '').length >= 3).length
+        : (data.text.match(/[A-Za-zÀ-ÿ0-9]{3,}/g) || []).length * data.confidence / 100;
+      if (!best || good > best.good) best = { data, good };
+      if (good >= 12) break;
+    }
+    const out = parseReceipt(best.data.text);
+    out.confidence = best.data.confidence;
+    return out;
+  } finally { worker.terminate(); }
 }
+
+const norm = s => s.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+const AMT_RE = /(?<![\d,.])(\d{1,3}(?:[ .]\d{3})+|\d+)\s?[,.]\s?(\d{2})(?!\d|[./]\d)/g;
+const amountsOf = line => [...line.matchAll(AMT_RE)].map(m => parseFloat(m[1].replace(/[ .]/g, '') + '.' + m[2])).filter(n => n > 0 && n < 100000);
+const MONTHS = ['janv', 'fevr', 'mars', 'avr', 'mai', 'juin', 'juil', 'aout', 'sept', 'oct', 'nov', 'dec'];
 
 function parseReceipt(text) {
   const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-  const amtRe = /(\d{1,3}(?:[ .]\d{3})*|\d+)[,.](\d{2})(?!\d)/g;
-  const toNum = m => parseFloat(m[1].replace(/[ .]/g, '') + '.' + m[2]);
-  const all = [], keyed = [];
-  for (const l of lines) {
-    const nums = [...l.matchAll(amtRe)].map(toNum).filter(n => n > 0 && n < 100000);
-    all.push(...nums);
-    if (/total|montant|net\s*à?\s*payer|a\s*payer|à\s*payer|ttc|carte|cb\b|espèces|especes/i.test(l)) keyed.push(...nums);
-  }
-  const amount = keyed.length ? Math.max(...keyed) : all.length ? Math.max(...all) : 0;
+  const L = lines.map(raw => ({ raw, n: norm(raw) }));
 
+  // --- montant : mots-clés fiables d'abord, jamais les lignes de solde / sous-total / TVA ---
+  const bad = /solde|sous.?total|dont|\btva\b|t\.v\.a|rendu|monnaie|remise|reduction|fidelite|economie|hors taxe|\bht\b/;
+  const pick = (re, next) => {
+    for (let i = 0; i < L.length; i++) {
+      if (!re.test(L[i].n) || bad.test(L[i].n)) continue;
+      let a = amountsOf(L[i].raw);
+      if (!a.length && next && L[i + 1]) a = amountsOf(L[i + 1].raw);
+      if (a.length) return a[a.length - 1];
+    }
+    return 0;
+  };
+  let amount = pick(/net a payer|a payer|total ttc|montant ttc|total a regler|a regler|montant du|montant paye|net payer/, true)
+    || pick(/\btotal\b/, false)
+    || pick(/\b(cb|carte|visa|mastercard|especes|cheque|paiement)\b/, false);
+  if (!amount) {
+    const all = L.filter(x => !bad.test(x.n)).flatMap(x => amountsOf(x.raw));
+    amount = all.length ? Math.max(...all) : 0;
+  }
+
+  // --- TVA : taux (%) et montant, dans les lignes qui suivent le mot TVA ---
+  let vat = null, vatRate = null;
+  const ti = L.findIndex(x => /\btva\b|t\.v\.a/.test(x.n));
+  if (ti >= 0 && amount > 0) {
+    const found = [];
+    const rateRe = /(\d{1,2}(?:[.,]\d{1,2})?)\s*%/;
+    for (let i = ti; i < Math.min(L.length, ti + 6); i++) {
+      const rm = L[i].n.match(rateRe);
+      if (!rm) continue;
+      const rate = parseFloat(rm[1].replace(',', '.'));
+      if (!(rate > 0 && rate <= 25)) continue;
+      let c = amountsOf(L[i].raw.replace(rateRe, ' '));
+      if (!c.length && L[i + 1]) c = amountsOf(L[i + 1].raw);
+      c = c.filter(v => v < amount * 0.3);
+      if (c.length) found.push({ rate, c });
+    }
+    if (found.length === 1) {
+      const { rate, c } = found[0], exp = amount * rate / (100 + rate);
+      vat = c.reduce((a, b) => (Math.abs(b - exp) < Math.abs(a - exp) ? b : a));
+      vatRate = rate;
+    } else if (found.length > 1) {
+      vat = found.reduce((s, f) => s + Math.min(...f.c), 0);
+    }
+    if (vat != null) vat = Math.round(vat * 100) / 100;
+  }
+
+  // --- date : numérique (08/10/2026) ou en toutes lettres (08 octobre 2026) ---
+  const t = norm(text), cands = [];
+  const m1 = t.match(/(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4}|\d{2})\b/);
+  if (m1) cands.push({ i: m1.index, d: +m1[1], m: +m1[2], y: +m1[3] });
+  const m2 = t.match(new RegExp(`(\\d{1,2})\\s*(${MONTHS.join('|')})[a-z]*\\.?\\s*(\\d{4})`));
+  if (m2) cands.push({ i: m2.index, d: +m2[1], m: MONTHS.indexOf(m2[2]) + 1, y: +m2[3] });
   let date = null;
-  const dm = text.match(/(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4}|\d{2})\b/);
-  if (dm) {
-    let y = +dm[3]; if (y < 100) y += 2000;
-    const mo = +dm[2], da = +dm[1];
-    if (mo >= 1 && mo <= 12 && da >= 1 && da <= 31) date = `${y}-${pad(mo)}-${pad(da)}`;
+  cands.sort((a, b) => a.i - b.i);
+  for (const c of cands) {
+    const y = c.y < 100 ? c.y + 2000 : c.y;
+    if (c.m >= 1 && c.m <= 12 && c.d >= 1 && c.d <= 31 && y >= 2000 && y <= new Date().getFullYear() + 1) { date = `${y}-${pad(c.m)}-${pad(c.d)}`; break; }
   }
 
-  const merchant = (lines.find(l => (l.match(/[A-Za-zÀ-ÿ]/g) || []).length >= 3 && !/^\d/.test(l) && !/ticket|facture|tel|tél|www|siret/i.test(l)) || '')
+  // --- commerçant : première vraie ligne de texte (pas une adresse, un numéro, une date…) ---
+  const skip = /ticket|facture|\btel\b|www|siret|siren|caisse|merci|badge|etablissement|n°|^le (lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)|\b(rue|avenue|bd|boulevard|place|chemin|route|impasse)\b/;
+  const merchant = (lines.slice(0, 10).find(l => (l.match(/[A-Za-zÀ-ÿ]/g) || []).length >= 4 && !/^\d/.test(l) && !skip.test(norm(l))) || '')
     .replace(/[^A-Za-zÀ-ÿ0-9 '&.\-]/g, '').trim().slice(0, 40);
 
-  const t = text.toLowerCase();
   let category = 'other';
-  if (/restaurant|brasserie|bistro|café|cafe|boulangerie|pizz|burger|sandwich|menu|boisson|plat|dessert/.test(t)) category = 'meals';
-  else if (/sncf|train|taxi|uber|péage|peage|essence|carburant|gazole|parking|autoroute|total ?energies|station|billet/.test(t)) category = 'travel';
-  else if (/hôtel|hotel|ibis|novotel|nuit|chambre|airbnb/.test(t)) category = 'lodging';
+  if (/restaurant|brasserie|bistro|cafe|boulangerie|pizz|burger|sandwich|menu|boisson|plat|dessert|cantine|\bself\b|repas|convention|traiteur/.test(t)) category = 'meals';
+  else if (/sncf|train|taxi|uber|peage|essence|carburant|gazole|parking|autoroute|totalenergies|station|billet/.test(t)) category = 'travel';
+  else if (/hotel|ibis|novotel|nuit|chambre|airbnb/.test(t)) category = 'lodging';
   else if (/papeterie|bureau|fourniture|cartouche|stylo|office|cahier/.test(t)) category = 'supplies';
-  return { merchant, amount, date, category };
+  return { merchant, amount, date, category, vat, vatRate };
 }
 
 async function ocrClaude(blob, S) {
@@ -499,7 +644,7 @@ async function ocrClaude(blob, S) {
       model: S.model, max_tokens: 400,
       messages: [{ role: 'user', content: [
         { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: b64 } },
-        { type: 'text', text: 'Lis ce ticket de caisse. Réponds uniquement par un objet JSON : {"merchant": string, "amount": nombre (total TTC payé), "date": "AAAA-MM-JJ" ou null, "category": "meals"|"travel"|"lodging"|"supplies"|"other", "confidence": nombre entre 0 et 1}.' },
+        { type: 'text', text: 'Lis ce ticket de caisse. Réponds uniquement par un objet JSON : {"merchant": string, "amount": nombre (total TTC payé), "date": "AAAA-MM-JJ" ou null, "vat": nombre (montant total de TVA) ou null, "vat_rate": nombre (taux en %) ou null, "category": "meals"|"travel"|"lodging"|"supplies"|"other", "confidence": nombre entre 0 et 1}. Ignore les soldes de compte et sous-totaux : amount est le net à payer.' },
       ] }],
     }),
   });
@@ -512,7 +657,7 @@ async function ocrClaude(blob, S) {
   const m = txt.match(/\{[\s\S]*\}/);
   if (!m) throw new Error('Réponse illisible de l’API');
   const o = JSON.parse(m[0]);
-  return { merchant: o.merchant || '', amount: Number(o.amount) || 0, date: /^\d{4}-\d{2}-\d{2}$/.test(o.date || '') ? o.date : null, category: o.category, confidence: o.confidence != null ? o.confidence * 100 : null };
+  return { merchant: o.merchant || '', amount: Number(o.amount) || 0, date: /^\d{4}-\d{2}-\d{2}$/.test(o.date || '') ? o.date : null, category: o.category, vat: Number(o.vat) > 0 ? Number(o.vat) : null, vatRate: Number(o.vat_rate) > 0 ? Number(o.vat_rate) : null, confidence: o.confidence != null ? o.confidence * 100 : null };
 }
 
 function blobToBase64(blob) {
@@ -537,8 +682,9 @@ async function downscale(source, maxSide = 2000) {
 
 async function handleImage(source) {
   try {
-    const blob = await downscale(source);
-    draft = newDraft(blob); draftIsNew = true;
+    const big = source instanceof Blob ? source : await downscale(source, 3500);
+    const blob = await downscale(big);
+    draft = newDraft(blob); draftIsNew = true; draft.ocrSource = big;
     location.hash = '#/review';
     runOcr();
   } catch { toast('Image illisible'); }
@@ -656,9 +802,9 @@ function download(name, blob) {
 function exportCsv() {
   if (!expenses.length) { toast('Aucune dépense à exporter'); return; }
   const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
-  const rows = [['Date', 'Commerçant', 'Montant', 'Catégorie', 'Statut', 'Notes'].map(q).join(';')];
+  const rows = [['Date', 'Commerçant', 'Montant TTC', 'TVA', 'Taux TVA', 'Montant HT', 'Catégorie', 'Statut', 'Notes'].map(q).join(';')];
   for (const e of [...expenses].sort((a, b) => a.date.localeCompare(b.date))) {
-    rows.push([e.date, e.merchant, e.amount.toFixed(2).replace('.', ','), CATS[e.category]?.label, STATUS[e.status]?.label, e.notes].map(q).join(';'));
+    rows.push([e.date, e.merchant, e.amount.toFixed(2).replace('.', ','), e.vat != null ? fmtNum(e.vat) : '', e.vatRate != null ? String(e.vatRate).replace('.', ',') : '', e.vat != null ? fmtNum(e.amount - e.vat) : '', CATS[e.category]?.label, STATUS[e.status]?.label, e.notes].map(q).join(';'));
   }
   download(`expenseflow-${ymd(new Date())}.csv`, new Blob(['﻿' + rows.join('\r\n')], { type: 'text/csv;charset=utf-8' }));
 }
