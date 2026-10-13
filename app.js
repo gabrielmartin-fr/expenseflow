@@ -913,6 +913,14 @@ routes.profile = function () {
       <button class="btn ghost" id="demo">${ic('science')} Ajouter des données de démo</button>
       <button class="btn danger" id="wipe">${ic('delete_forever')} Tout effacer</button>
     </section>
+    <section class="card lg mb16 stack">
+      <h2 class="sec mb8">Installation sur le téléphone</h2>
+      ${isStandalone()
+        ? '<p class="muted">Vous utilisez déjà l’application installée : rien à faire.</p>'
+        : installEvt
+          ? '<p class="muted mb8">Installez ExpenseFlow pour l’ouvrir en plein écran depuis une icône.</p><button class="btn pri" id="install">Installer l’application</button>'
+          : '<p class="muted">Le navigateur ne propose pas l’installation pour le moment. Causes possibles : application déjà installée (cherchez-la dans le tiroir d’applications), navigation privée, ou navigateur autre que Chrome.</p>'}
+    </section>
     <p class="muted" style="text-align:center">ExpenseFlow · données stockées localement</p>`;
   render({ title: 'Profil', brand: false, html, active: 'profile' });
 
@@ -922,6 +930,14 @@ routes.profile = function () {
   bind('apiKey', 'apiKey', v => v.trim());
   bind('model', 'model', v => v.trim() || DEFAULTS.model);
   $('#provider').addEventListener('change', e => { Settings.set({ provider: e.target.value }); $('#claudeOpts').hidden = e.target.value !== 'claude'; });
+  const ib = $('#install');
+  if (ib) ib.onclick = async () => {
+    const ev = installEvt; installEvt = null;
+    if (!ev) return;
+    ev.prompt();
+    try { await ev.userChoice; } catch { /* ignoré */ }
+    routes.profile();
+  };
   $('#csv').onclick = exportCsv;
   $('#bk').onclick = backup;
   $('#rs').onclick = () => $('#rsf').click();
@@ -990,6 +1006,12 @@ async function loadDemo() {
   }
   await reload();
 }
+
+// ---------- installation (PWA) ----------
+let installEvt = null;
+const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvt = e; if (location.hash === '#/profile') routes.profile(); });
+window.addEventListener('appinstalled', () => { installEvt = null; toast('Application installée'); if (location.hash === '#/profile') routes.profile(); });
 
 // ---------- démarrage ----------
 (async function init() {
