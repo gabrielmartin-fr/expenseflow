@@ -411,8 +411,10 @@ function paintOcrState() {
   box.innerHTML = d.ocr === 'running'
     ? `<div class="ai mb16"><div class="c">${ic('progress_activity', 'spin')}</div><div class="grow"><b>Analyse du ticket…</b><p class="muted" id="ocrmsg">${esc(d.ocrMsg || 'Lecture du texte')}</p></div></div>`
     : d.ocr === 'error' ? `<div class="note warn mb16">${esc(d.ocrMsg)} — vous pouvez saisir les informations à la main.</div>` : '';
-  conf.innerHTML = d.confidence != null
-    ? `<div class="ai"><div class="c">${ic('auto_awesome')}</div><div class="grow"><div class="row between mb8"><span class="label" style="color:var(--sec)">Fiabilité de la lecture</span><b style="color:var(--sec)">${Math.round(d.confidence)}%</b></div><div class="bar"><i style="width:${Math.round(d.confidence)}%"></i></div></div></div>` : '';
+  const raw = d.rawText != null
+    ? `<details class="note mb16" style="margin-top:12px"><summary style="cursor:pointer;font-weight:600">Texte lu par l’OCR</summary><pre style="white-space:pre-wrap;font:12px/16px monospace;margin-top:8px">${esc(d.rawText.trim() || '(aucun texte détecté)')}</pre></details>` : '';
+  conf.innerHTML = raw + (d.confidence != null
+    ? `<div class="ai"><div class="c">${ic('auto_awesome')}</div><div class="grow"><div class="row between mb8"><span class="label" style="color:var(--sec)">Fiabilité de la lecture</span><b style="color:var(--sec)">${Math.round(d.confidence)}%</b></div><div class="bar"><i style="width:${Math.round(d.confidence)}%"></i></div></div></div>` : '');
 }
 
 function openLightbox(url) {
@@ -459,6 +461,7 @@ function applyOcr(d, r) {
   if (!d.dirty.has('vat')) d.vat = r.vat > 0 ? fmtNum(r.vat) : '';
   if (!d.dirty.has('vatRate')) d.vatRate = r.vatRate > 0 ? String(r.vatRate).replace('.', ',') : '';
   if (r.confidence != null) d.confidence = r.confidence;
+  if (r.rawText != null) d.rawText = r.rawText;
 }
 
 function syncForm() {
@@ -467,15 +470,60 @@ function syncForm() {
   updateHt();
 }
 
-// recadre sur le ticket, passe en niveaux de gris contrastés (le scan peut être une page A4 avec un petit ticket)
-async function cropToContent(blob) {
+// ---- prétraitement : trouve le ticket (clair sur fond sombre OU encre sur fond clair), uniformise l'éclairage ----
+function otsu(hist, total) {
+  let sum = 0; for (let i = 0; i < 256; i++) sum += i * hist[i];
+  let wB = 0, sumB = 0, best = 0, thr = 128;
+  for (let t = 0; t < 256; t++) {
+    wB += hist[t]; if (!wB) continue;
+    const wF = total - wB; if (!wF) break;
+    sumB += t * hist[t];
+    const mB = sumB / wB, mF = (sum - sumB) / wF, v = wB * wF * (mB - mF) * (mB - mF);
+    if (v > best) { best = v; thr = t; }
+  }
+  return thr;
+}
+
+// seuillage local (image intégrale) : supprime ombres et dégradés d'une photo
+function adaptiveBinary(g, w, h) {
+  const win = Math.max(25, Math.round(Math.min(w, h) / 8)) | 1, r = win >> 1;
+  const iw = w + 1, ii = new Uint32Array(iw * (h + 1));
+  for (let y = 0; y < h; y++) {
+    let row = 0;
+    for (let x = 0; x < w; x++) { row += g[y * w + x]; ii[(y + 1) * iw + x + 1] = ii[y * iw + x + 1] + row; }
+  }
+  const out = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const y0 = Math.max(0, y - r), y1 = Math.min(h, y + r + 1);
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.max(0, x - r), x1 = Math.min(w, x + r + 1);
+      const s = ii[y1 * iw + x1] - ii[y0 * iw + x1] - ii[y1 * iw + x0] + ii[y0 * iw + x0];
+      out[y * w + x] = g[y * w + x] * (x1 - x0) * (y1 - y0) < s * 0.88 ? 0 : 255;
+    }
+  }
+  return out;
+}
+
+function grayToCanvas(g, w, h, scale) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const ctx = c.getContext('2d'), id = ctx.createImageData(w, h);
+  for (let i = 0, o = 0; i < g.length; i++, o += 4) { id.data[o] = id.data[o + 1] = id.data[o + 2] = g[i]; id.data[o + 3] = 255; }
+  ctx.putImageData(id, 0, 0);
+  if (scale === 1) return c;
+  const b = document.createElement('canvas'); b.width = Math.round(w * scale); b.height = Math.round(h * scale);
+  b.getContext('2d').drawImage(c, 0, 0, b.width, b.height);
+  return b;
+}
+
+// retourne deux versions : recadrée sur le ticket (seuil local) et page entière (contraste étiré)
+async function prepareImages(blob) {
   const bmp = await createImageBitmap(blob);
   const k0 = Math.min(1, 3500 / Math.max(bmp.width, bmp.height));
   const w = Math.round(bmp.width * k0), h = Math.round(bmp.height * k0);
   const c = document.createElement('canvas'); c.width = w; c.height = h;
   const ctx = c.getContext('2d', { willReadFrequently: true });
   ctx.drawImage(bmp, 0, 0, w, h);
-  const img = ctx.getImageData(0, 0, w, h), px = img.data;
+  const px = ctx.getImageData(0, 0, w, h).data;
 
   const g = new Uint8Array(w * h), hist = new Uint32Array(256);
   for (let i = 0, p = 0; i < g.length; i++, p += 4) {
@@ -483,39 +531,75 @@ async function cropToContent(blob) {
     g[i] = v; hist[v]++;
   }
   const pct = q => { let acc = 0; const t = g.length * q; for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= t) return v; } return 255; };
-  const lo = pct(0.005), hi = Math.max(lo + 40, pct(0.9));
-  for (let i = 0; i < g.length; i++) g[i] = Math.max(0, Math.min(255, ((g[i] - lo) * 255) / (hi - lo)));
 
-  // zone du ticket : cellules de 16 px contenant de l'encre et entourées d'autres cellules (ignore les poussières du scan)
-  const S = 16, gw = Math.ceil(w / S), gh = Math.ceil(h / S), cells = new Uint16Array(gw * gh);
-  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (g[y * w + x] < 160) cells[(y >> 4) * gw + (x >> 4)]++;
-  const on = (cx, cy) => cx >= 0 && cy >= 0 && cx < gw && cy < gh && cells[cy * gw + cx] >= 4;
+  // version « page entière » : contraste étiré
+  const lo = pct(0.005), hi = Math.max(lo + 40, pct(0.9));
+  const st = new Uint8Array(g.length);
+  for (let i = 0; i < g.length; i++) st[i] = Math.max(0, Math.min(255, ((g[i] - lo) * 255) / (hi - lo)));
+  const full = grayToCanvas(st, w, h, Math.min(1, 2600 / Math.max(w, h)));
+
+  // image binaire à seuil local (insensible aux ombres et aux dégradés)
+  const bin = adaptiveBinary(g, w, h);
+
+  // 1) zone de papier = plus grande zone claire (cellules de 16 px) ; 2) texte = cellules d'encre entourées d'autres cellules d'encre
+  const S = 16, gw = Math.ceil(w / S), gh = Math.ceil(h / S);
+  const sumv = new Float32Array(gw * gh), npx = new Uint16Array(gw * gh), ink = new Uint16Array(gw * gh);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const ci = (y >> 4) * gw + (x >> 4);
+    npx[ci]++; sumv[ci] += g[y * w + x];
+    if (!bin[y * w + x]) ink[ci]++;
+  }
+  const thr = otsu(hist, g.length);
+  const bright = new Uint8Array(gw * gh);
+  for (let i = 0; i < bright.length; i++) bright[i] = npx[i] && sumv[i] / npx[i] > thr ? 1 : 0;
+  const seen = new Uint8Array(gw * gh); let comp = [];
+  for (let s = 0; s < bright.length; s++) {
+    if (!bright[s] || seen[s]) continue;
+    const cur = [], stack = [s]; seen[s] = 1;
+    while (stack.length) {
+      const i = stack.pop(); cur.push(i);
+      const cx = i % gw, cy = (i / gw) | 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const nx = cx + dx, ny = cy + dy;
+        if (nx < 0 || ny < 0 || nx >= gw || ny >= gh) continue;
+        const ni = ny * gw + nx;
+        if (bright[ni] && !seen[ni]) { seen[ni] = 1; stack.push(ni); }
+      }
+    }
+    if (cur.length > comp.length) comp = cur;
+  }
+  let px0 = 0, py0 = 0, px1 = gw - 1, py1 = gh - 1;
+  if (comp.length) {
+    px0 = gw; py0 = gh; px1 = -1; py1 = -1;
+    for (const i of comp) { const cx = i % gw, cy = (i / gw) | 0; if (cx < px0) px0 = cx; if (cx > px1) px1 = cx; if (cy < py0) py0 = cy; if (cy > py1) py1 = cy; }
+  }
+  const on = (cx, cy) => cx >= px0 && cx <= px1 && cy >= py0 && cy <= py1 && ink[cy * gw + cx] >= 4;
   let x0 = gw, y0 = gh, x1 = -1, y1 = -1;
-  for (let cy = 0; cy < gh; cy++) for (let cx = 0; cx < gw; cx++) {
+  for (let cy = py0; cy <= py1; cy++) for (let cx = px0; cx <= px1; cx++) {
     if (!on(cx, cy)) continue;
     let n = 0;
     for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) if ((dx || dy) && on(cx + dx, cy + dy)) n++;
     if (n < 4) continue;
     if (cx < x0) x0 = cx; if (cx > x1) x1 = cx; if (cy < y0) y0 = cy; if (cy > y1) y1 = cy;
   }
+  // page presque entière claire (scan A4) : on se cale sur le texte ; sinon (photo) on garde toute la zone de papier
+  const paperShare = (px1 - px0 + 1) * (py1 - py0 + 1) / (gw * gh);
+  if (paperShare < 0.8) { x0 = px0; y0 = py0; x1 = px1; y1 = py1; }
   let sx = 0, sy = 0, sw = w, sh = h;
   if (x1 >= 0) {
     const m = 40;
     sx = Math.max(0, x0 * S - m); sy = Math.max(0, y0 * S - m);
     sw = Math.min(w, (x1 + 1) * S + m) - sx; sh = Math.min(h, (y1 + 1) * S + m) - sy;
   }
-  const scale = Math.max(1, Math.min(2.5, 1800 / Math.max(sw, sh)));
-  const out = document.createElement('canvas'); out.width = sw; out.height = sh;
-  const oi = out.getContext('2d').createImageData(sw, sh);
-  for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) {
-    const v = g[(sy + y) * w + sx + x], o = (y * sw + x) * 4;
-    oi.data[o] = oi.data[o + 1] = oi.data[o + 2] = v; oi.data[o + 3] = 255;
-  }
-  out.getContext('2d').putImageData(oi, 0, 0);
-  if (scale === 1) return out;
-  const big = document.createElement('canvas'); big.width = Math.round(sw * scale); big.height = Math.round(sh * scale);
-  big.getContext('2d').drawImage(out, 0, 0, big.width, big.height);
-  return big;
+  if (sw * sh < w * h * 0.02) { sx = 0; sy = 0; sw = w; sh = h; }   // zone trop petite : on garde tout
+  const region = new Uint8Array(sw * sh);
+  for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) region[y * sw + x] = g[(sy + y) * w + sx + x];
+  // on agrandit le niveau de gris AVANT de seuiller : un petit ticket garde ainsi des caractères lisibles
+  const scale = Math.max(1, Math.min(3, 2400 / Math.max(sw, sh), Math.sqrt(12e6 / (sw * sh))));
+  const gc = grayToCanvas(region, sw, sh, scale), cw2 = gc.width, ch2 = gc.height;
+  const gd = gc.getContext('2d').getImageData(0, 0, cw2, ch2).data, gg = new Uint8Array(cw2 * ch2);
+  for (let i = 0; i < gg.length; i++) gg[i] = gd[i * 4];
+  return { crop: grayToCanvas(adaptiveBinary(gg, cw2, ch2), cw2, ch2, 1), full, info: { region: [sx, sy, sw, sh], size: [w, h], paper: [px0, py0, px1, py1] } };
 }
 
 function rotateCanvas(c, a) {
@@ -528,30 +612,88 @@ function rotateCanvas(c, a) {
   return r;
 }
 
+// angle d'inclinaison des lignes de texte (profil de projection), en degrés, entre -25 et +25
+function estimateSkew(c) {
+  const tmp = document.createElement('canvas'); tmp.width = c.width; tmp.height = c.height;
+  const tc = tmp.getContext('2d', { willReadFrequently: true });
+  tc.drawImage(c, 0, 0);
+  const full = tc.getImageData(0, 0, c.width, c.height).data;
+  const f = Math.max(1, Math.ceil(Math.max(c.width, c.height) / 800));       // bloc de f×f pixels : « encre » s'il contient un pixel sombre
+  const w = Math.ceil(c.width / f), h = Math.ceil(c.height / f), blocks = new Uint8Array(w * h);
+  for (let y = 0; y < c.height; y++) for (let x = 0; x < c.width; x++) if (full[(y * c.width + x) * 4] < 128) blocks[((y / f) | 0) * w + ((x / f) | 0)] = 1;
+  const xs = [], ys = [];
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (blocks[y * w + x]) { xs.push(x); ys.push(y); }  if (xs.length < 200) return 0;
+  const step = Math.max(1, Math.floor(xs.length / 40000)), diag = Math.ceil(Math.hypot(w, h));
+  const score = deg => {
+    const t = deg * Math.PI / 180, cs = Math.cos(t), sn = Math.sin(t), bins = new Float32Array(2 * diag + 2);
+    for (let i = 0; i < xs.length; i += step) bins[Math.round(ys[i] * cs - xs[i] * sn) + diag]++;
+    let q = 0; for (let i = 0; i < bins.length; i++) q += bins[i] * bins[i];
+    return q;
+  };
+  let best = 0, bs = -1;
+  for (let a = -25; a <= 25; a += 1) { const v = score(a); if (v > bs) { bs = v; best = a; } }
+  for (let a = best - 1; a <= best + 1; a += 0.25) { const v = score(a); if (v > bs) { bs = v; best = a; } }
+  return best;
+}
+
+function deskewCanvas(c, deg) {
+  const t = deg * Math.PI / 180, cs = Math.abs(Math.cos(t)), sn = Math.abs(Math.sin(t));
+  const r = document.createElement('canvas');
+  r.width = Math.round(c.width * cs + c.height * sn); r.height = Math.round(c.width * sn + c.height * cs);
+  const x = r.getContext('2d');
+  x.fillStyle = '#fff'; x.fillRect(0, 0, r.width, r.height);
+  x.translate(r.width / 2, r.height / 2); x.rotate(-t);
+  x.drawImage(c, -c.width / 2, -c.height / 2);
+  return r;
+}
+// reconstitue les lignes du ticket à partir de la position des mots (libellé et prix sur la même ligne, même s'ils sont éloignés)
+function rowsFromWords(words) {
+  const ws = (words || []).filter(w => w.text && w.text.trim() && w.confidence > 25 && w.bbox);
+  if (!ws.length) return '';
+  const hs = ws.map(w => w.bbox.y1 - w.bbox.y0).sort((a, b) => a - b), med = hs[hs.length >> 1] || 20;
+  ws.sort((a, b) => (a.bbox.y0 + a.bbox.y1) - (b.bbox.y0 + b.bbox.y1));
+  const rows = [];
+  for (const w of ws) {
+    const cy = (w.bbox.y0 + w.bbox.y1) / 2, r = rows[rows.length - 1];
+    if (r && Math.abs(cy - r.cy) < med * 0.6) { r.w.push(w); r.cy = r.w.reduce((s, x) => s + (x.bbox.y0 + x.bbox.y1) / 2, 0) / r.w.length; }
+    else rows.push({ cy, w: [w] });
+  }
+  return rows.map(r => r.w.sort((a, b) => a.bbox.x0 - b.bbox.x0).map(x => x.text.trim()).join(' ')).join('\n');
+}
 async function ocrLocal(blob, onMsg) {
   onMsg('Chargement du moteur OCR…');
   if (!window.Tesseract) await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js');
   onMsg('Préparation de l’image…');
-  const base = await cropToContent(blob);
+  const prep = await prepareImages(blob);
   const worker = await Tesseract.createWorker('fra', 1, {
     logger: m => { if (m.status === 'recognizing text') onMsg(`Lecture du texte… ${Math.round((m.progress || 0) * 100)}%`); else if (m.status) onMsg('Préparation (langue française)…'); },
   });
   try {
-    await worker.setParameters({ tessedit_pageseg_mode: '4', preserve_interword_spaces: '1' });
-    let best = null;
-    // essaie l'orientation d'origine puis les rotations (ticket scanné ou photographié de travers)
-    for (const angle of [0, 90, 270, 180]) {
-      if (angle) onMsg(`Test de l’orientation (${angle}°)…`);
-      const { data } = await worker.recognize(rotateCanvas(base, angle));
-      const good = data.words
-        ? data.words.filter(w => w.confidence > 70 && w.text.replace(/[^A-Za-zÀ-ÿ0-9]/g, '').length >= 3).length
-        : (data.text.match(/[A-Za-zÀ-ÿ0-9]{3,}/g) || []).length * data.confidence / 100;
-      if (!best || good > best.good) best = { data, good };
-      if (good >= 12) break;
+    await worker.setParameters({ tessedit_pageseg_mode: '6', preserve_interword_spaces: '1' });
+    let overall = null;
+    for (const variant of [prep.crop, prep.full]) {
+      let best = null;
+      // essaie l'orientation d'origine puis les rotations (ticket scanné ou photographié de travers)
+      for (const angle of [0, 90, 270, 180]) {
+        if (angle) onMsg(`Test de l’orientation (${angle}°)…`);
+        const turned = rotateCanvas(variant, angle), skew = estimateSkew(turned);
+        const { data } = await worker.recognize(Math.abs(skew) >= 0.5 ? deskewCanvas(turned, skew) : turned);
+        const good = data.words
+          ? data.words.filter(w => w.confidence > 70 && w.text.replace(/[^A-Za-zÀ-ÿ0-9]/g, '').length >= 3).length
+          : (data.text.match(/[A-Za-zÀ-ÿ0-9]{3,}/g) || []).length * data.confidence / 100;
+        if (!best || good > best.good) best = { data, good };
+        if (good >= 12) break;
+      }
+      const text = rowsFromWords(best.data.words) || best.data.text;
+      const out = parseReceipt(text);
+      out.confidence = best.data.confidence;
+      out.rawText = text;
+      out.score = (out.amount > 0 ? 2 : 0) + (out.merchant ? 1 : 0) + (out.date ? 1 : 0);
+      if (!overall || out.score > overall.score) overall = out;
+      if (out.amount > 0 && out.score >= 3) break;      // résultat convaincant : inutile d'essayer l'autre version
+      onMsg('Seconde tentative de lecture…');
     }
-    const out = parseReceipt(best.data.text);
-    out.confidence = best.data.confidence;
-    return out;
+    return overall;
   } finally { worker.terminate(); }
 }
 

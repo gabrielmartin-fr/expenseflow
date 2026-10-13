@@ -1,4 +1,4 @@
-﻿const CACHE = 'expenseflow-v2';
+﻿const CACHE = 'expenseflow-v3';
 const SHELL = ['./', './index.html', './styles.css', './app.js', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 const RUNTIME_HOSTS = ['fonts.googleapis.com', 'fonts.gstatic.com', 'cdn.jsdelivr.net'];
 
